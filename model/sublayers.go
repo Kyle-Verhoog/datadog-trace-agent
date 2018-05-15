@@ -103,6 +103,9 @@ func ComputeSublayers(trace Trace) []SublayerValue {
 	durationsByType := computeDurationByAttr(
 		timestamps, activeSpans, func(s *Span) string { return s.Type },
 	)
+	durationsByName := computeDurationByAttr(
+		timestamps, activeSpans, func(s *Span) string { return s.Name },
+	)
 
 	// Generate sublayers values
 	values := make([]SublayerValue, 0,
@@ -121,6 +124,14 @@ func ComputeSublayers(trace Trace) []SublayerValue {
 		values = append(values, SublayerValue{
 			Metric: "_sublayers.duration.by_type",
 			Tag:    Tag{"sublayer_type", spanType},
+			Value:  float64(int64(duration)),
+		})
+	}
+
+	for spanName, duration := range durationsByName {
+		values = append(values, SublayerValue{
+			Metric: "_sublayers.duration.by_name",
+			Tag:    Tag{"sublayer_name", spanName},
 			Value:  float64(int64(duration)),
 		})
 	}
