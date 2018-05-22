@@ -341,12 +341,3 @@ func traceContainsError(trace model.Trace) bool {
 	}
 	return false
 }
-
-func traceContainsError(trace model.Trace) bool {
-	for _, span := range trace {
-		if span.Error != 0 {
-			return true
-		}
-	}
-	return false
-}
