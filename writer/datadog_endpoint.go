@@ -4,9 +4,24 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+
+	"github.com/DataDog/datadog-trace-agent/info"
 )
 
-const apiHTTPHeaderKey = "DD-Api-Key"
+// A few constants used for this endpoint implementation
+const (
+	userAgentPrefix     = "Datadog Trace Agent"
+	userAgentSupportURL = "https://github.com/DataDog/datadog-trace-agent"
+)
+
+var (
+	// userAgent is the computed user agent we'll use when
+	// communicating with Datadog
+	userAgent = fmt.Sprintf(
+		"%s/%s/%s (+%s)",
+		userAgentPrefix, info.Version, info.GitCommit, userAgentSupportURL,
+	)
+)
 
 // DatadogEndpoint sends payloads to Datadog API.
 type DatadogEndpoint struct {
@@ -41,9 +56,7 @@ func (e *DatadogEndpoint) Write(payload *Payload) error {
 		return err
 	}
 
-	// Set API key in the header and issue the request
-	req.Header.Set(apiHTTPHeaderKey, e.apiKey)
-
+	e.writeHeaders(req)
 	SetExtraHeaders(req.Header, payload.Headers)
 
 	resp, err := e.client.Do(req)
@@ -74,6 +87,17 @@ func (e *DatadogEndpoint) Write(payload *Payload) error {
 
 	// Everything went fine
 	return nil
+}
+
+// writeHeaders writes the common HTTP headers for each requests to
+// Datadog, including the API key.
+func (e *DatadogEndpoint) writeHeaders(req *http.Request) {
+	// API Key
+	req.Header.Set("DD-Api-Key", e.apiKey)
+
+	// User Agent - Make it unique to the trace agent, and specify
+	// the version.
+	req.Header.Set("User-Agent", userAgent)
 }
 
 func (e *DatadogEndpoint) String() string {
