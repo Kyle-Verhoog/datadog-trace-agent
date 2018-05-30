@@ -122,6 +122,7 @@ func mergeIniConfig(c *AgentConfig, conf *File) error {
 	// [trace.analyzed_rate_by_service] section
 	// undocumented
 	if v, e := conf.GetSection("trace.analyzed_rate_by_service"); e == nil {
+		log.Warn("analyzed_rate_by_service is deprecated, please use analyzed_spans instead")
 		rates := v.KeysHash()
 		for service, rate := range rates {
 			rate, err := strconv.ParseFloat(rate, 64)
@@ -368,7 +369,7 @@ func readProxyURL(m *ini.Section) (*url.URL, error) {
 func parseAnalyzedSpanFormat(name string) (string, string, error) {
 	splits := strings.Split(name, "|")
 	if len(splits) != 2 {
-		return "", "", fmt.Errorf("Bad format for operation name and service name in: %s, it should have format: service_name/operation_name", name)
+		return "", "", fmt.Errorf("Bad format for operation name and service name in: %s, it should have format: service_name|operation_name", name)
 	}
 	return splits[0], splits[1], nil
 }
