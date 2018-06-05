@@ -13,6 +13,7 @@ import (
 	"github.com/DataDog/datadog-trace-agent/model"
 	"github.com/DataDog/datadog-trace-agent/quantizer"
 	"github.com/DataDog/datadog-trace-agent/sampler"
+	"github.com/DataDog/datadog-trace-agent/statsd"
 	"github.com/DataDog/datadog-trace-agent/watchdog"
 	"github.com/DataDog/datadog-trace-agent/writer"
 )
@@ -43,15 +44,17 @@ type Agent struct {
 	Concentrator       *Concentrator
 	Filters            []filters.Filter
 	ScoreSampler       *Sampler
+	ErrorsScoreSampler *Sampler
 	PrioritySampler    *Sampler
-	TransactionSampler *TransactionSampler
+	TransactionSampler TransactionSampler
 	TraceWriter        *writer.TraceWriter
 	ServiceWriter      *writer.ServiceWriter
 	StatsWriter        *writer.StatsWriter
 	ServiceExtractor   *TraceServiceExtractor
 	ServiceMapper      *ServiceMapper
 
-	sampledTraceChan chan *model.Trace
+	sampledTraceChan        chan *model.Trace
+	analyzedTransactionChan chan *model.Span
 
 	// config
 	conf    *config.AgentConfig
@@ -86,8 +89,9 @@ func NewAgent(ctx context.Context, conf *config.AgentConfig) *Agent {
 	f := filters.Setup(conf)
 
 	ss := NewScoreSampler(conf)
+	ess := NewErrorsSampler(conf)
 	ps := NewPrioritySampler(conf, dynConf)
-	ts := NewTransactionSampler(conf, analyzedTransactionChan)
+	ts := NewTransactionSampler(conf)
 	se := NewTraceServiceExtractor(serviceChan)
 	sm := NewServiceMapper(serviceChan, filteredServiceChan)
 	tw := writer.NewTraceWriter(conf, sampledTraceChan, analyzedTransactionChan)
@@ -95,22 +99,24 @@ func NewAgent(ctx context.Context, conf *config.AgentConfig) *Agent {
 	svcW := writer.NewServiceWriter(conf, filteredServiceChan)
 
 	return &Agent{
-		Receiver:           r,
-		Concentrator:       c,
-		Filters:            f,
-		ScoreSampler:       ss,
-		PrioritySampler:    ps,
-		TransactionSampler: ts,
-		TraceWriter:        tw,
-		StatsWriter:        sw,
-		ServiceWriter:      svcW,
-		ServiceExtractor:   se,
-		ServiceMapper:      sm,
-		sampledTraceChan:   sampledTraceChan,
-		conf:               conf,
-		dynConf:            dynConf,
-		ctx:                ctx,
-		die:                die,
+		Receiver:                r,
+		Concentrator:            c,
+		Filters:                 f,
+		ScoreSampler:            ss,
+		ErrorsScoreSampler:      ess,
+		PrioritySampler:         ps,
+		TransactionSampler:      ts,
+		TraceWriter:             tw,
+		StatsWriter:             sw,
+		ServiceWriter:           svcW,
+		ServiceExtractor:        se,
+		ServiceMapper:           sm,
+		sampledTraceChan:        sampledTraceChan,
+		analyzedTransactionChan: analyzedTransactionChan,
+		conf:    conf,
+		dynConf: dynConf,
+		ctx:     ctx,
+		die:     die,
 	}
 }
 
@@ -134,6 +140,7 @@ func (a *Agent) Run() {
 	a.ServiceWriter.Start()
 	a.Concentrator.Start()
 	a.ScoreSampler.Run()
+	a.ErrorsScoreSampler.Run()
 	a.PrioritySampler.Run()
 
 	for {
@@ -153,6 +160,7 @@ func (a *Agent) Run() {
 			a.ServiceMapper.Stop()
 			a.ServiceWriter.Stop()
 			a.ScoreSampler.Stop()
+			a.ErrorsScoreSampler.Stop()
 			a.PrioritySampler.Stop()
 			return
 		}
@@ -175,13 +183,17 @@ func (a *Agent) Process(t model.Trace) {
 	// TODO: get the real tagStats related to this trace payload.
 	ts := a.Receiver.stats.GetTagStats(info.Tags{})
 
-	samplers := []*Sampler{
-		// Always use score sampler so it has a real idea of trace distribution
-		a.ScoreSampler,
+	// All traces should go through either through the normal score sampler or
+	// the one dedicated to errors
+	samplers := make([]*Sampler, 0, 2)
+	if traceContainsError(t) {
+		samplers = append(samplers, a.ErrorsScoreSampler)
+	} else {
+		samplers = append(samplers, a.ScoreSampler)
 	}
 
-	priority, ok := root.Metrics[samplingPriorityKey]
-	if ok {
+	priority, hasPriority := root.Metrics[samplingPriorityKey]
+	if hasPriority {
 		// If Priority is defined, send to priority sampling, regardless of priority value.
 		// The sampler will keep or discard the trace, but we send everything so that it
 		// gets the big picture and can set the sampling rates accordingly.
@@ -189,7 +201,7 @@ func (a *Agent) Process(t model.Trace) {
 	}
 
 	priorityPtr := &ts.TracesPriorityNone
-	if ok {
+	if hasPriority {
 		if priority < 0 {
 			priorityPtr = &ts.TracesPriorityNeg
 		} else if priority == 0 {
@@ -211,7 +223,7 @@ func (a *Agent) Process(t model.Trace) {
 	}
 
 	for _, f := range a.Filters {
-		if f.Keep(root) {
+		if f.Keep(root, &t) {
 			continue
 		}
 
@@ -266,10 +278,18 @@ func (a *Agent) Process(t model.Trace) {
 		a.Concentrator.Add(pt)
 
 	}()
+	if hasPriority && priority < 0 {
+		// If the trace has a negative priority we absolutely don't want it
+		// sampled either by the trace or transaction pipeline so we return here
+		return
+	}
+
+	// Run both full trace sampling and transaction extraction in another goroutine
 	go func() {
 		defer watchdog.LogOnPanic()
-		sampled := false
 
+		// Trace sampling
+		sampled := false
 		for _, s := range samplers {
 			// Consider trace as sampled if at least one of the samplers kept it
 			sampled = s.Add(pt) || sampled
@@ -278,13 +298,10 @@ func (a *Agent) Process(t model.Trace) {
 		if sampled {
 			a.sampledTraceChan <- &pt.Trace
 		}
+
+		// Transactions extraction
+		a.TransactionSampler.Extract(pt, a.analyzedTransactionChan)
 	}()
-	if a.TransactionSampler.Enabled() {
-		go func() {
-			defer watchdog.LogOnPanic()
-			a.TransactionSampler.Add(pt)
-		}()
-	}
 }
 
 func (a *Agent) watchdog() {
@@ -313,5 +330,16 @@ func (a *Agent) watchdog() {
 	a.Receiver.preSampler.SetRate(rate)
 	a.Receiver.preSampler.SetError(err)
 
-	info.UpdatePreSampler(*a.Receiver.preSampler.Stats())
+	preSamplerStats := a.Receiver.preSampler.Stats()
+	statsd.Client.Gauge("datadog.trace_agent.presampler_rate", preSamplerStats.Rate, nil, 1)
+	info.UpdatePreSampler(*preSamplerStats)
+}
+
+func traceContainsError(trace model.Trace) bool {
+	for _, span := range trace {
+		if span.Error != 0 {
+			return true
+		}
+	}
+	return false
 }

@@ -1,10 +1,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/url"
 	"os"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -18,10 +20,11 @@ import (
 // YamlAgentConfig is a structure used for marshaling the datadog.yaml configuration
 // available in Agent versions >= 6
 type YamlAgentConfig struct {
-	APIKey   string `yaml:"api_key"`
-	HostName string `yaml:"hostname"`
-	LogLevel string `yaml:"log_level"`
-	Proxy    proxy  `yaml:"proxy"`
+	APIKey            string `yaml:"api_key"`
+	HostName          string `yaml:"hostname"`
+	LogLevel          string `yaml:"log_level"`
+	Proxy             proxy  `yaml:"proxy"`
+	SkipSSLValidation *bool  `yaml:"skip_ssl_validation"`
 
 	StatsdPort int `yaml:"dogstatsd_port"`
 
@@ -35,14 +38,16 @@ type proxy struct {
 }
 
 type traceAgent struct {
-	Enabled            *bool    `yaml:"enabled"`
-	Endpoint           string   `yaml:"apm_dd_url"`
-	Env                string   `yaml:"env"`
-	ExtraSampleRate    float64  `yaml:"extra_sample_rate"`
-	MaxTracesPerSecond float64  `yaml:"max_traces_per_second"`
-	IgnoreResources    []string `yaml:"ignore_resources"`
-	ReceiverPort       int      `yaml:"receiver_port"`
-	APMNonLocalTraffic *bool    `yaml:"apm_non_local_traffic"`
+	Enabled            *bool          `yaml:"enabled"`
+	Endpoint           string         `yaml:"apm_dd_url"`
+	Env                string         `yaml:"env"`
+	ExtraSampleRate    float64        `yaml:"extra_sample_rate"`
+	MaxTracesPerSecond float64        `yaml:"max_traces_per_second"`
+	IgnoreResources    []string       `yaml:"ignore_resources"`
+	LogFilePath        string         `yaml:"log_file"`
+	ReplaceTags        []*ReplaceRule `yaml:"replace_tags"`
+	ReceiverPort       int            `yaml:"receiver_port"`
+	APMNonLocalTraffic *bool          `yaml:"apm_non_local_traffic"`
 
 	WatchdogMaxMemory float64 `yaml:"max_memory"`
 	WatchdogMaxCPUPct float64 `yaml:"max_cpu_percent"`
@@ -52,9 +57,17 @@ type traceAgent struct {
 	ServiceWriter serviceWriter `yaml:"service_writer"`
 	StatsWriter   statsWriter   `yaml:"stats_writer"`
 
-	AnalyzedRateByService map[string]float64 `yaml:"analyzed_rate_by_service"`
+	AnalyzedRateByServiceLegacy map[string]float64 `yaml:"analyzed_rate_by_service"`
+	AnalyzedSpans               map[string]float64 `yaml:"analyzed_spans"`
 
 	DDAgentBin string `yaml:"dd_agent_bin"`
+}
+
+type ReplaceRule struct {
+	Name    string         `yaml:"name"`
+	Pattern string         `yaml:"pattern"`
+	Re      *regexp.Regexp `yaml:"-"`
+	Repl    string         `yaml:"repl"`
 }
 
 type traceWriter struct {
@@ -118,6 +131,9 @@ func mergeYamlConfig(agentConf *AgentConfig, yc *YamlAgentConfig) error {
 	if yc.HostName != "" {
 		agentConf.HostName = yc.HostName
 	}
+	if yc.LogLevel != "" {
+		agentConf.LogLevel = yc.LogLevel
+	}
 	if yc.StatsdPort > 0 {
 		agentConf.StatsdPort = yc.StatsdPort
 	}
@@ -143,12 +159,20 @@ func mergeYamlConfig(agentConf *AgentConfig, yc *YamlAgentConfig) error {
 		}
 	}
 
+	if yc.SkipSSLValidation != nil {
+		agentConf.SkipSSLValidation = *yc.SkipSSLValidation
+	}
+
 	if yc.TraceAgent.Enabled != nil {
 		agentConf.Enabled = *yc.TraceAgent.Enabled
 	}
 
 	if yc.TraceAgent.Endpoint != "" {
 		agentConf.APIEndpoint = yc.TraceAgent.Endpoint
+	}
+
+	if yc.TraceAgent.LogFilePath != "" {
+		agentConf.LogFilePath = yc.TraceAgent.LogFilePath
 	}
 
 	if yc.TraceAgent.Env != "" {
@@ -168,6 +192,14 @@ func mergeYamlConfig(agentConf *AgentConfig, yc *YamlAgentConfig) error {
 
 	if len(yc.TraceAgent.IgnoreResources) > 0 {
 		agentConf.Ignore["resource"] = yc.TraceAgent.IgnoreResources
+	}
+
+	if rt := yc.TraceAgent.ReplaceTags; rt != nil {
+		err := compileReplaceRules(rt)
+		if err != nil {
+			return fmt.Errorf("replace_tags: %s", err)
+		}
+		agentConf.ReplaceTags = rt
 	}
 
 	if yc.TraceAgent.APMNonLocalTraffic != nil && *yc.TraceAgent.APMNonLocalTraffic {
@@ -190,8 +222,26 @@ func mergeYamlConfig(agentConf *AgentConfig, yc *YamlAgentConfig) error {
 	agentConf.StatsWriterConfig = readStatsWriterConfigYaml(yc.TraceAgent.StatsWriter)
 	agentConf.TraceWriterConfig = readTraceWriterConfigYaml(yc.TraceAgent.TraceWriter)
 
-	// undocumented
-	agentConf.AnalyzedRateByService = yc.TraceAgent.AnalyzedRateByService
+	// undocumented deprecated
+	agentConf.AnalyzedRateByServiceLegacy = yc.TraceAgent.AnalyzedRateByServiceLegacy
+	if len(yc.TraceAgent.AnalyzedRateByServiceLegacy) > 0 {
+		log.Warn("analyzed_rate_by_service is deprecated, please use analyzed_spans instead")
+	}
+	// undocumeted
+	for key, rate := range yc.TraceAgent.AnalyzedSpans {
+		serviceName, operationName, err := parseAnalyzedSpanFormat(key)
+		if err != nil {
+			log.Errorf("Error when parsing names", err)
+			continue
+		}
+
+		service := agentConf.AnalyzedSpansByService[serviceName]
+		if service == nil {
+			service = make(map[string]float64)
+			agentConf.AnalyzedSpansByService[serviceName] = service
+		}
+		service[operationName] = rate
+	}
 
 	// undocumented
 	agentConf.DDAgentBin = defaultDDAgentBin
@@ -281,6 +331,25 @@ func readExponentialBackoffConfigYaml(yc queueablePayloadSender) backoff.Exponen
 	}
 
 	return c
+}
+
+// compileReplaceRules compiles the regular expressions found in the replace rules.
+// If it fails it returns the first error.
+func compileReplaceRules(rules []*ReplaceRule) error {
+	for _, r := range rules {
+		if r.Name == "" {
+			return errors.New(`all rules must have a "name" property (use "*" to target all)`)
+		}
+		if r.Pattern == "" {
+			return errors.New(`all rules must have a "pattern"`)
+		}
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			return fmt.Errorf("key %q: %s", r.Name, err)
+		}
+		r.Re = re
+	}
+	return nil
 }
 
 // getDuration returns the duration of the provided value in seconds
