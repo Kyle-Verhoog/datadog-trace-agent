@@ -203,7 +203,7 @@ func runAgent(ctx context.Context) {
 		die("cannot configure dogstatsd: %v", err)
 	}
 
-	// Track the application start
+	// count the number of times the agent started
 	statsd.Client.Count("datadog.trace_agent.started", 1, []string{
 		"version:" + info.Version,
 	}, 1)
