@@ -42,6 +42,7 @@ func (pt *processedTrace) weight() float64 {
 // Agent struct holds all the sub-routines structs and make the data flow between them
 type Agent struct {
 	Receiver           *HTTPReceiver
+	UDSReceiver        *UDSReceiver
 	Concentrator       *Concentrator
 	Filters            []filters.Filter
 	ScoreSampler       *Sampler

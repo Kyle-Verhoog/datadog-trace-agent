@@ -57,6 +57,9 @@ type AgentConfig struct {
 	ConnectionLimit int // for rate-limiting, how many unique connections to allow in a lease period (30s)
 	ReceiverTimeout int
 
+	UDSReceiverFile    string
+	UDSReceiverEnabled bool
+
 	// Writers
 	ServiceWriterConfig writerconfig.ServiceWriterConfig
 	StatsWriterConfig   writerconfig.StatsWriterConfig
@@ -115,6 +118,9 @@ func New() *AgentConfig {
 		ReceiverHost:    "localhost",
 		ReceiverPort:    8126,
 		ConnectionLimit: 2000,
+
+		UDSReceiverFile:    "/tmp/dd_trace_agent.sock",
+		UDSReceiverEnabled: false,
 
 		ServiceWriterConfig: writerconfig.DefaultServiceWriterConfig(),
 		StatsWriterConfig:   writerconfig.DefaultStatsWriterConfig(),
